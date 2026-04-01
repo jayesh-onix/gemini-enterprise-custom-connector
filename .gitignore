@@ -1,0 +1,20 @@
+# Environments
+venv/
+.env
+
+# Python caching
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary outputs
+output_sample.jsonl
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
