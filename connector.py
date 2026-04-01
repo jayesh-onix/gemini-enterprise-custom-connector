@@ -14,6 +14,7 @@ This connector serves as a working template. To adapt it for Highspot:
 =============================================================================
 """
 
+import concurrent.futures
 import os
 import sys
 import json
@@ -299,10 +300,16 @@ def import_from_gcs(cfg: Config, gcs_uri: str) -> None:
         # This is a Long Running Operation (LRO) — we poll until complete
         operation = client.import_documents(request=request)
         log.info(f"  Import operation started: {operation.operation.name}")
-        log.info("  Waiting for import to complete (this may take a few minutes)...")
+        log.info("  Waiting for import to complete (this may take a few minutes; large imports can take longer than 10 minutes)")
 
         # Poll the LRO
-        result = operation.result(timeout=600)   # 10-minute timeout
+        try:
+            result = operation.result(timeout=1800)   # 30-minute timeout
+        except concurrent.futures.TimeoutError:
+            log.warning("Import did not complete within 30 minutes. The operation is still running in Google Cloud.")
+            log.warning(f"Operation name: {operation.operation.name}")
+            log.warning("Check the GCP Console or use the operation name to inspect progress.")
+            return
 
         # Log any partial errors
         if result.error_samples:
@@ -327,10 +334,13 @@ def import_from_gcs(cfg: Config, gcs_uri: str) -> None:
 # STEP 3c: INFRASTRUCTURE PROVISIONING  —  Ensure Bucket & Data Store exist
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ensure_infrastructure(cfg: Config) -> None:
+def ensure_infrastructure(cfg: Config) -> int:
     """
     Ensures that the target Google Cloud Storage bucket and Discovery Engine 
     Data Store pipeline exist before attempting to push data.
+    
+    Returns:
+        The content_config (int) of the Data Store.
     """
     log.info("Checking infrastructure prerequisites...")
     
@@ -354,15 +364,42 @@ def ensure_infrastructure(cfg: Config) -> None:
     name = f"{parent}/dataStores/{cfg.data_store_id}"
     
     try:
-        ds_client.get_data_store(name=name)
-        log.info(f"  ✓ Data Store '{cfg.data_store_id}' exists.")
+        data_store = ds_client.get_data_store(name=name)
+        actual_content_config = int(data_store.content_config)
+        
+        # We prefer CONTENT_REQUIRED, but we'll allow NO_CONTENT if we adapt the documents
+        expected_content_config = int(discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED)
+        
+        if actual_content_config != expected_content_config:
+            content_config_name = "unknown"
+            try:
+                # In proto-plus, we can get the name from the enum class
+                content_config_name = discoveryengine.DataStore.ContentConfig(actual_content_config).name
+            except Exception:
+                content_config_name = str(actual_content_config)
+            
+            if actual_content_config == int(discoveryengine.DataStore.ContentConfig.NO_CONTENT):
+                log.warning(f"  [!] Data Store '{cfg.data_store_id}' exists but is configured with {content_config_name}.")
+                log.warning("  [!] This connector will proceed by stripping the 'content' field to remain compatible.")
+            else:
+                log.error(f"  [!] Data Store '{cfg.data_store_id}' has incompatible content_config: {content_config_name}")
+                raise ValueError(
+                    f"Data Store '{cfg.data_store_id}' exists with content_config={content_config_name}. "
+                    "It must be CONTENT_REQUIRED or NO_CONTENT. "
+                    "Please recreate the data store or use a compatible one."
+                )
+        else:
+            log.info(f"  ✓ Data Store '{cfg.data_store_id}' exists with correct configuration.")
+        
+        return actual_content_config
+
     except NotFound:
         log.info(f"  Data Store '{cfg.data_store_id}' not found. Creating (this takes a few minutes)...")
         data_store = discoveryengine.DataStore(
             display_name=cfg.data_store_id,
             industry_vertical=discoveryengine.IndustryVertical.GENERIC,
             solution_types=[discoveryengine.SolutionType.SOLUTION_TYPE_SEARCH],
-            content_config=discoveryengine.DataStore.ContentConfig.NO_CONTENT,
+            content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
         )
         request = discoveryengine.CreateDataStoreRequest(
             parent=parent,
@@ -372,6 +409,7 @@ def ensure_infrastructure(cfg: Config) -> None:
         operation = ds_client.create_data_store(request=request)
         operation.result()  # Wait for creation
         log.info(f"  ✓ Data Store '{cfg.data_store_id}' created successfully.")
+        return int(discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,7 +504,14 @@ def run(cfg: Config, local_preview_only: bool = False) -> None:
         return
 
     # ── STEP 5: PRE-REQUISITE CHECKS ─────────────────────────────
-    ensure_infrastructure(cfg)
+    actual_content_config = ensure_infrastructure(cfg)
+
+    # If the data store is NO_CONTENT, we must strip the content field from documents
+    # to avoid import errors, as Discovery Engine will reject them.
+    if actual_content_config == int(discoveryengine.DataStore.ContentConfig.NO_CONTENT):
+        log.warning("Stripping 'content' field from all documents for NO_CONTENT compatibility...")
+        for doc in documents:
+            doc.pop("content", None)
 
     # ── STEP 6: UPLOAD TO GCS ────────────────────────────────────
     gcs_uri = upload_to_gcs(documents, cfg.gcs_bucket, cfg.gcs_blob)
