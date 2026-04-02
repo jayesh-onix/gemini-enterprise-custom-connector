@@ -21,7 +21,7 @@ from typing import List, Optional
 from dataclasses import dataclass, field
 
 import requests
-from google.cloud import storage
+from google.cloud import storage, secretmanager
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.api_core.exceptions import GoogleAPIError, NotFound
 from dotenv import load_dotenv
@@ -61,9 +61,15 @@ class Config:
     branch_id:     str = field(default_factory=lambda: os.environ.get(
                                    "BRANCH_ID", "0"))
 
-    # Source API (JSONPlaceholder — no auth needed)
+    # Source API
     source_base_url: str = field(default_factory=lambda: os.environ.get(
                                    "SOURCE_BASE_URL", "https://jsonplaceholder.typicode.com"))
+
+    # Secret Manager configuration
+    secret_api_credentials: str = field(default_factory=lambda: os.environ.get(
+                                   "SECRET_API_CREDENTIALS", ""))
+    secret_acl_mapping: str = field(default_factory=lambda: os.environ.get(
+                                   "SECRET_ACL_MAPPING", ""))
 
     # Sync mode: "full" replaces everything; "incremental" adds/updates only
     sync_mode:     str = field(default_factory=lambda: os.environ.get("SYNC_MODE", "incremental"))
@@ -71,6 +77,19 @@ class Config:
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_secret(project_id: str, secret_name: str) -> Optional[str]:
+    if not secret_name:
+        return None
+    log.info(f"Fetching secret: {secret_name}")
+    try:
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+        response = client.access_secret_version(request={"name": name})
+        return response.payload.data.decode("UTF-8")
+    except Exception as e:
+        log.warning(f"Failed to fetch secret '{secret_name}': {e}")
+        return None
 
 def fetch_data(base_url: str, since: Optional[str] = None) -> List[dict]:
     """Fetches records from the source API and shuffles/limits to 25 for testing."""
@@ -99,7 +118,7 @@ def fetch_users(base_url: str) -> dict:
     resp.raise_for_status()
     return {u["id"]: u for u in resp.json()}
 
-def build_discovery_engine_doc(record: dict, users: dict) -> dict:
+def build_discovery_engine_doc(record: dict, users: dict, acl_mapping: dict = None) -> dict:
     """Transforms raw record into Discovery Engine Document format."""
     doc_id = f"doc-{record['id']}"
     user_id = record.get("userId", 0)
@@ -109,7 +128,7 @@ def build_discovery_engine_doc(record: dict, users: dict) -> dict:
     salt = f" [SyncID: {random.randint(1000, 9999)}]"
     content_text = f"Title: {record.get('title')}\n\nBody: {record.get('body')}{salt}"
     
-    return {
+    doc = {
         "id": doc_id,
         "structData": {
             "title":        record.get("title"),
@@ -124,6 +143,9 @@ def build_discovery_engine_doc(record: dict, users: dict) -> dict:
             "rawBytes": base64.b64encode(content_text.encode("utf-8")).decode("utf-8"),
         },
     }
+    if acl_mapping:
+        doc["aclInfo"] = acl_mapping
+    return doc
 
 def ensure_infrastructure(cfg: Config) -> int:
     """Ensures that the target GCS bucket and Data Store exist."""
@@ -221,10 +243,21 @@ def run_sync(since: Optional[str] = None, preview: bool = False):
     # 1. Infrastructure Check
     content_config = ensure_infrastructure(cfg)
 
+    # Fetch ACL mapping if configured
+    acl_mapping = None
+    if cfg.secret_acl_mapping:
+        acl_payload = fetch_secret(cfg.project_id, cfg.secret_acl_mapping)
+        if acl_payload:
+            import json
+            try:
+                acl_mapping = json.loads(acl_payload)
+            except Exception as e:
+                log.warning(f"Failed to parse ACL mapping as JSON: {e}")
+
     # 2. Fetch & Transform
     raw_data = fetch_data(cfg.source_base_url, since=since)
     users = fetch_users(cfg.source_base_url)
-    documents = [build_discovery_engine_doc(r, users) for r in raw_data]
+    documents = [build_discovery_engine_doc(r, users, acl_mapping=acl_mapping) for r in raw_data]
     
     # Handle NO_CONTENT stores
     if content_config == int(discoveryengine.DataStore.ContentConfig.NO_CONTENT):

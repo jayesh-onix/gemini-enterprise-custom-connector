@@ -30,6 +30,8 @@ graph TD
     D -->|Auto-Create| E[(GCS Staging Bucket)]
     D -->|Auto-Create| F[(Vertex AI Data Store)]
     C -->|Fail| Z[Log Errors & Abort]
+    B -.->|Fetch Secrets| S((Secret Manager))
+    S -.->|ACL & Keys| B
     B -->|3. Upload JSONL| E
     E -->|4. Trigger Bulk Import| F
     F -->|5. Indexing| G[Gemini Enterprise App]
@@ -46,6 +48,7 @@ graph TD
 - **Fast Testing:** Built-in randomization logic that samples **25 records** per run to keep iteration cycles under 60 seconds.
 - **Dynamic Content:** Injects random `SyncID` salts during testing to ensure Discovery Engine detects changes for incremental verification.
 - **Production Ready:** Includes a `Dockerfile` for Cloud Run Jobs and a `setup.sh` for automated GCP deployment.
+- **Enterprise Security (NEW):** Integrated with Google Secret Manager to dynamically inject API keys and Document-Level Access Controls (ACLs). Runs on a dedicated least-privilege service account.
 
 ---
 
@@ -83,6 +86,8 @@ GCP_PROJECT_ID=your-project-id
 GCS_BUCKET=your-staging-bucket
 DATA_STORE_ID=your-data-store-id
 SOURCE_BASE_URL=https://jsonplaceholder.typicode.com
+SECRET_API_CREDENTIALS=your-api-key-secret-name
+SECRET_ACL_MAPPING=your-acl-mapping-secret-name
 ```
 
 ---
@@ -131,6 +136,7 @@ docker build -t ge-connector .
 Use `setup.sh` to automate the deployment of:
 - **Cloud Run Jobs:** To execute the `connector.py` in a managed, serverless environment.
 - **Cloud Scheduler:** To trigger the sync job automatically every 4 hours (configurable).
+- **Service Accounts:** Automatically provisions `ge-connector-sa` with restricted IAM roles (`storage.admin`, `discoveryengine.editor`, `secretmanager.secretAccessor`).
 
 ---
 

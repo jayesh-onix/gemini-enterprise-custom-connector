@@ -27,7 +27,8 @@ gcloud services enable \
   storage.googleapis.com \
   run.googleapis.com \
   cloudbuild.googleapis.com \
-  cloudscheduler.googleapis.com
+  cloudscheduler.googleapis.com \
+  secretmanager.googleapis.com
 
 echo "✓ APIs enabled"
 
@@ -42,6 +43,31 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="user:${USER_EMAIL}" \
   --role="roles/storage.admin"
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="user:${USER_EMAIL}" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Create a dedicated service account for the connector
+SERVICE_ACCOUNT_NAME="ge-connector-sa"
+SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+echo "Creating service account ${SERVICE_ACCOUNT_EMAIL}..."
+gcloud iam service-accounts create "${SERVICE_ACCOUNT_NAME}" \
+  --display-name="Gemini Enterprise Connector Service Account" || true
+
+# Grant permissions to the service account
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+  --role="roles/discoveryengine.editor"
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+  --role="roles/storage.admin"
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+  --role="roles/secretmanager.secretAccessor"
 
 echo "✓ IAM roles granted"
 
@@ -83,6 +109,7 @@ gcloud builds submit \
 gcloud run jobs create jsonplaceholder-sync-job \
   --image "${IMAGE_NAME}" \
   --region "${REGION}" \
+  --service-account "${SERVICE_ACCOUNT_EMAIL}" \
   --max-retries 2 \
   --set-env-vars "GCP_PROJECT_ID=${PROJECT_ID},GCS_BUCKET=${GCS_BUCKET},DATA_STORE_ID=${DATA_STORE_ID},SYNC_MODE=full"
 
@@ -104,7 +131,7 @@ gcloud scheduler jobs create http jsonplaceholder-sync-schedule \
   --schedule "0 */4 * * *" \
   --uri "https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/jsonplaceholder-sync-job:run" \
   --message-body "{}" \
-  --oauth-service-account-email "${USER_EMAIL}" \
+  --oauth-service-account-email "${SERVICE_ACCOUNT_EMAIL}" \
   --location "${REGION}"
 
 echo "✓ Cloud Scheduler created — syncs every 4 hours"
