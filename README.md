@@ -1,28 +1,6 @@
 # Gemini Enterprise Custom Connector
 
-**Purpose:** A production-ready test connector that uses JSONPlaceholder
-(free fake REST API) as the data source, following Google's official custom
-connector architecture from:
-https://docs.cloud.google.com/gemini/enterprise/docs/connectors/create-custom-connector
-
-Once you confirm this works end-to-end, replace the JSONPlaceholder
-fetch functions with Highspot API calls — all GCS + Discovery Engine
-sync logic stays identical.
-
----
-
-## Project structure
-
-```
-jsonplaceholder-ge-connector/
-├── connector.py        ← main connector (fetch + transform + sync)
-├── test_local.py       ← local validation before touching GCP
-├── requirements.txt    ← Python dependencies
-├── Dockerfile          ← for Cloud Run Job deployment
-├── .env.example        ← copy to .env and fill in your values
-├── setup.sh            ← GCP setup commands (run manually section by section)
-└── README.md           ← this file
-```
+A production-ready custom connector framework for **Google Discovery Engine** (Vertex AI Search). This project implements the official **GCS Staging Pattern**, enabling high-volume data ingestion from any REST API (e.g., Highspot, Salesforce, JSONPlaceholder) into a searchable enterprise knowledge base.
 
 ---
 
@@ -38,272 +16,126 @@ Follows the official Google Fetch → Transform → Sync pattern:
 6. **DE IMPORT** — calls Discovery Engine import API to index documents
 7. **GE APP** — data store connected to GE App → searchable in chat
 
-### Custom Connector Architecture Flowchart
+---
+
+## Architecture
+
+The connector follows Google's recommended **Fetch → Transform → Sync** pipeline for maximum reliability and scalability.
 
 ```mermaid
 graph TD
-    A[3rd Party API <br> e.g., JSONPlaceholder/Highspot] -->|1. Fetch JSON Data| B(Connector Script <br> Python)
-    B -->|2. Transform & Encode Base64| C{Pre-flight Validation}
+    A[3rd Party API <br> e.g., Highspot / Mock API] -->|1. Fetch JSON| B(Connector Script <br> Python)
+    B -->|2. Transform & Encode| C{Schema Validation}
     C -->|Pass| D[Infrastructure Check]
-    D -->|Create if missing| E[(GCS Staging Bucket)]
-    D -->|Create if missing| F[(Vertex AI Data Store)]
+    D -->|Auto-Create| E[(GCS Staging Bucket)]
+    D -->|Auto-Create| F[(Vertex AI Data Store)]
     C -->|Fail| Z[Log Errors & Abort]
-    B -->|3. Upload .jsonl| E
-    E -->|4. Trigger LRO Import| F
+    B -->|3. Upload JSONL| E
+    E -->|4. Trigger Bulk Import| F
     F -->|5. Indexing| G[Gemini Enterprise App]
-    G -->|Search/Chat| H((End User))
-    
+    G -->|Search / Chat| H((End User))
 ```
 
 ---
 
-## Step-by-step guide
+## Key Features
 
-### Phase 1 — Local setup and testing (no GCP required)
+- **Auto-Provisioning:** Automatically detects and creates missing GCS buckets and Vertex AI Data Stores.
+- **Incremental Sync:** Intelligent delta-syncs using `--since` timestamps to fetch only new or modified data.
+- **GCS Staging:** Batches data into `.jsonl` for high-performance ingestion (recommended for production).
+- **Fast Testing:** Built-in randomization logic that samples **25 records** per run to keep iteration cycles under 60 seconds.
+- **Dynamic Content:** Injects random `SyncID` salts during testing to ensure Discovery Engine detects changes for incremental verification.
+- **Production Ready:** Includes a `Dockerfile` for Cloud Run Jobs and a `setup.sh` for automated GCP deployment.
 
-**Step 1.1 — Install dependencies**
+---
 
+## Project Structure
+
+```text
+.
+├── connector.py            # Main production script (Fetch -> Transform -> Sync)
+├── mock_service.py         # Dynamic local API for randomized testing
+├── test_incremental_flow.py# Automated end-to-end test orchestration
+├── requirements.txt        # Google Cloud & HTTP dependencies
+├── Dockerfile              # Container definition for Cloud Run Jobs
+├── .env.example            # Template for required environment variables
+└── setup.sh                # GCP infrastructure deployment script
+```
+
+---
+
+## Getting Started
+
+### 1. Installation
 ```bash
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-**Step 1.2 — Run local tests first**
-
-This validates the fetch + transform + validate pipeline completely locally.
-No GCP credentials needed at this stage.
-
-```bash
-python test_local.py
+### 2. Configuration
+Copy `.env.example` to `.env` and configure your GCP and Source settings:
+```env
+GCP_PROJECT_ID=your-project-id
+GCS_BUCKET=your-staging-bucket
+DATA_STORE_ID=your-data-store-id
+SOURCE_BASE_URL=https://jsonplaceholder.typicode.com
 ```
-
-Expected output:
-```
-✅ ALL TESTS PASSED — Ready to run against GCP
-```
-
-This also creates `output_sample.jsonl` — inspect this file:
-```bash
-cat output_sample.jsonl | python -m json.tool | head -80
-```
-
-Confirm each line looks like this:
-```json
-{
-  "id": "jsonplaceholder-post-1",
-  "structData": {
-    "title": "sunt aut facere repellat...",
-    "author": "Bret",
-    "source": "JSONPlaceholder",
-    "url": "https://jsonplaceholder.typicode.com/posts/1"
-  },
-  "content": {
-    "mimeType": "text/plain",
-    "rawBytes": "VGl0bGU6..."
-  }
-}
-```
-
-✅ **Checkpoint:** All 100 posts validated, JSONL looks correct.
 
 ---
 
-### Phase 2 — GCP prerequisites
+## Usage & Testing
 
-**Step 2.1 — Enable APIs**
+### **Incremental Sync Test (Mock Data)**
+To analyze incremental sync behavior without hitting real APIs or incurring costs:
 
-```bash
-gcloud services enable \
-  discoveryengine.googleapis.com \
-  storage.googleapis.com \
-  run.googleapis.com \
-  cloudbuild.googleapis.com
-```
-
-**Step 2.2 — Grant IAM roles**
-
-```bash
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="user:your-email@example.com" \
-  --role="roles/discoveryengine.editor"
-
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="user:your-email@example.com" \
-  --role="roles/storage.admin"
-```
-
-✅ **Checkpoint:** APIs enabled and IAM Roles granted.
-
-*(Note: The connector script will now automatically create the GCS bucket and the Discovery Engine Data Store if they do not exist.)*
-
----
-
-
-### Phase 3 — Run connector locally (first real sync)
-
-**Step 3.1 — Set up environment variables**
-
-```bash
-cp .env.example .env
-```
-
-**Step 3.2 — Authenticate to GCP**
-
-```bash
-gcloud auth application-default login
-```
-
-**Step 3.3 — Run connector in preview mode first**
-
-```bash
-GCP_PROJECT_ID=your-project \
-GCS_BUCKET=jsonplaceholder-ge-connector-staging \
-DATA_STORE_ID=jsonplaceholder-test-store \
-SYNC_MODE=full \
-venv/bin/python connector.py --preview
-```
-
-This runs fetch + transform + validate WITHOUT uploading to GCP.
-Confirm the logs show 100 documents and no errors.
-
-**Step 3.4 — Run the full connector**
-
-```bash
-GCP_PROJECT_ID=your-project \
-GCS_BUCKET=jsonplaceholder-ge-connector-staging \
-DATA_STORE_ID=jsonplaceholder-test-store \
-SYNC_MODE=full \
-venv/bin/python connector.py
-```
-
-✅ **Checkpoint:**
-- Terminal shows "✅ Connector run complete"
-- The bucket `jsonplaceholder-ge-connector-staging` is automatically created.
-- The Data store `jsonplaceholder-test-store` is automatically created.
-- GCS bucket contains `documents/jsonplaceholder_posts.jsonl`
-- GCP Console → Gemini Enterprise → Data Stores → `jsonplaceholder-test-store`
-  shows document count = 100 and status = Active
-
----
-
-### Phase 4 — Connect data store to GE App
-
-**Step 4.1**
-GCP Console → Gemini Enterprise → **Apps**
-
-**Step 5.2**
-Click your existing app OR click **Create app** → choose **Search** type → name it `Test Search App`
-
-**Step 5.3**
-Inside the app, click **Connected data stores** → **+ New data store**
-
-**Step 5.4**
-Select `jsonplaceholder-test-store` → click **Save**
-
-**Step 5.5**
-Wait for status to show **Active** (usually 1–3 minutes)
-
-✅ **Checkpoint:** App shows `jsonplaceholder-test-store` connected with status Active.
-
----
-
-### Phase 6 — Test in GE chat
-
-**Step 6.1**
-Open GE web UI (your org's GE URL or the URL shown in the App settings)
-
-**Step 6.2**
-Click **New chat** → click the **Connectors icon** (plug icon at bottom of input)
-
-**Step 6.3**
-Enable `jsonplaceholder-test-store`
-
-**Step 6.4**
-Ask test questions:
-
-| Query | Expected result |
-|---|---|
-| "Find posts about sunt aut facere" | Returns post 1 |
-| "Show me posts by Bret" | Returns posts by user Bret |
-| "What posts are from JSONPlaceholder?" | Returns multiple results |
-| "Find content about dolorem" | Semantic search hits |
-
-✅ **Checkpoint:** GE returns results that reference JSONPlaceholder posts with source attribution.
-
----
-
-### Phase 7 — Deploy to Cloud Run for automation (optional)
-
-**Step 7.1 — Build and push container**
-
-```bash
-gcloud builds submit \
-  --tag gcr.io/YOUR_PROJECT_ID/jsonplaceholder-ge-connector \
-  --project YOUR_PROJECT_ID
-```
-
-**Step 7.2 — Create Cloud Run Job**
-
-```bash
-gcloud run jobs create jsonplaceholder-sync-job \
-  --image gcr.io/YOUR_PROJECT_ID/jsonplaceholder-ge-connector \
-  --region us-central1 \
-  --max-retries 2 \
-  --set-env-vars "GCP_PROJECT_ID=your-project,GCS_BUCKET=jsonplaceholder-ge-connector-staging,DATA_STORE_ID=jsonplaceholder-test-store,SYNC_MODE=full"
-```
-
-**Step 7.3 — Test the Cloud Run Job manually**
-
-```bash
-gcloud run jobs execute jsonplaceholder-sync-job \
-  --region us-central1 \
-  --wait
-```
-
-✅ **Checkpoint:** Job runs successfully. Check logs in GCP Console → Cloud Run → Jobs.
-
----
-
-## How to adapt this for Highspot
-
-Once this connector works end-to-end with JSONPlaceholder, adapting it for
-Highspot requires changing only 3 things:
-
-1. **Replace `fetch_posts()` and `fetch_users()`** with Highspot API calls:
-   ```python
-   def fetch_spots():
-       resp = requests.get(f"{HIGHSPOT_URL}/v1/spots",
-                           auth=(API_KEY, API_SECRET))
-       return resp.json().get("spots", [])
+1. **Start the Mock API** (Terminal 1):
+   ```bash
+   python3 mock_service.py
    ```
-
-2. **Update `build_document()`** to map Highspot fields:
-   ```python
-   "id": f"highspot-item-{item['id']}",
-   "structData": {
-       "title": item.get("title"),
-       "spot":  spot.get("title"),
-       ...
-   }
+2. **Run the Automated Flow** (Terminal 2):
+   ```bash
+   python3 test_incremental_flow.py
    ```
+   *This script handles the full lifecycle: Initial Sync -> Source Update -> Incremental Sync -> Verification.*
 
-3. **Update environment variables** with Highspot credentials:
-   ```
-   HIGHSPOT_INSTANCE=https://api-su2.highspot.com
-   HIGHSPOT_API_KEY=your-key
-   HIGHSPOT_API_SECRET=your-secret
-   ```
+### **Production Command Line**
+```bash
+# Perform a Full Sync
+python3 connector.py
 
-Everything else — GCS upload, Discovery Engine import, GE App connection — stays **exactly the same**.
+# Perform an Incremental Sync (since yesterday)
+python3 connector.py --since "2026-04-01T00:00:00Z"
+
+# Safe Preview (Local transform only, no GCP upload)
+python3 connector.py --preview
+```
 
 ---
 
-## Official reference docs
+## Deployment (Production)
 
-| Topic | URL |
-|---|---|
-| Custom connector overview | docs.cloud.google.com/gemini/enterprise/docs/connectors/custom-connector |
-| Create custom connector | docs.cloud.google.com/gemini/enterprise/docs/connectors/create-custom-connector |
-| Prepare data (JSONL format) | docs.cloud.google.com/gemini/enterprise/docs/connectors/prepare-data |
-| Connect GCS data source | docs.cloud.google.com/gemini/enterprise/docs/connectors/connect-cloud-storage |
-| Connect data store to app | docs.cloud.google.com/gemini/enterprise/docs/connectors/connect-existing-data-store |
-| Discovery Engine Document format | cloud.google.com/generative-ai-app-builder/docs/reference/rest/v1/projects.locations.collections.dataStores.branches.documents |
+The connector is fully prepared for cloud-native deployment:
+
+### **1. Containerization**
+The included `Dockerfile` follows security best practices (non-root user, slim image).
+```bash
+# Build the image
+docker build -t ge-connector .
+```
+
+### **2. GCP Automation (`setup.sh`)**
+Use `setup.sh` to automate the deployment of:
+- **Cloud Run Jobs:** To execute the `connector.py` in a managed, serverless environment.
+- **Cloud Scheduler:** To trigger the sync job automatically every 4 hours (configurable).
+
+---
+
+## Adaptation Guide
+To adapt this for **Highspot** or other enterprise sources:
+1. Replace `fetch_data()` in `connector.py` with your source's authenticated API calls.
+2. Update `build_discovery_engine_doc()` to map your source's specific JSON schema to the Discovery Engine format.
+3. Keep all GCS and Discovery Engine logic—it is already optimized for production use.
