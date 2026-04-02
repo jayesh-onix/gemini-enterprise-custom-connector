@@ -76,12 +76,17 @@ def test_transform(posts, users):
     # Test single document
     sample_post = posts[0]
     sample_comments = fetch_comments_for_post(BASE_URL, sample_post["id"])
-    doc = build_document(sample_post, users, sample_comments)
+    
+    # Pass a dummy ACL mapping to verify it gets injected correctly
+    dummy_acl = {"readers": [{"principals": [{"groupId": "test-group@example.com"}]}]}
+    doc = build_document(sample_post, users, sample_comments, acl_mapping=dummy_acl)
 
     # Validate required fields
     assert "id" in doc,         "Document missing 'id'"
     assert "structData" in doc, "Document missing 'structData'"
     assert "content" in doc,    "Document missing 'content'"
+    assert "aclInfo" in doc,    "Document missing 'aclInfo'"
+    assert doc["aclInfo"] == dummy_acl, "Document 'aclInfo' does not match the provided mapping"
     assert doc["id"].startswith("jsonplaceholder-post-"), \
         f"ID format wrong: {doc['id']}"
     assert "rawBytes" in doc["content"], "Content missing 'rawBytes'"

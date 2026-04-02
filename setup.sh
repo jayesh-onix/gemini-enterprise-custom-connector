@@ -31,10 +31,31 @@ gcloud services enable \
 
 echo "✓ APIs enabled"
 
-# ── STEP 3: Grant IAM roles ───────────────────────────────────────────────────
-# Replace USER_EMAIL with your Google account email
+# ── STEP 3: Create Service Account & Grant IAM roles ────────────────────────────
+SA_NAME="ge-connector-sa"
+SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+echo "Creating dedicated Service Account: ${SA_EMAIL}"
+gcloud iam service-accounts create "${SA_NAME}" \
+  --description="Service account for Gemini Enterprise Connector" \
+  --display-name="GE Connector SA" || true # Ignore if already exists
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="roles/discoveryengine.editor"
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="roles/storage.admin"
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Replace USER_EMAIL with your Google account email for local testing
 USER_EMAIL="your-email@example.com"
 
+echo "Granting roles to local user for local testing: ${USER_EMAIL}"
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="user:${USER_EMAIL}" \
   --role="roles/discoveryengine.editor"
@@ -42,6 +63,10 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="user:${USER_EMAIL}" \
   --role="roles/storage.admin"
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="user:${USER_EMAIL}" \
+  --role="roles/secretmanager.secretAccessor"
 
 echo "✓ IAM roles granted"
 
@@ -84,7 +109,8 @@ gcloud run jobs create jsonplaceholder-sync-job \
   --image "${IMAGE_NAME}" \
   --region "${REGION}" \
   --max-retries 2 \
-  --set-env-vars "GCP_PROJECT_ID=${PROJECT_ID},GCS_BUCKET=${GCS_BUCKET},DATA_STORE_ID=${DATA_STORE_ID},SYNC_MODE=full"
+  --service-account="${SA_EMAIL}" \
+  --set-env-vars "GCP_PROJECT_ID=${PROJECT_ID},GCS_BUCKET=${GCS_BUCKET},DATA_STORE_ID=${DATA_STORE_ID},SYNC_MODE=full,SECRET_API_CREDENTIALS=your-api-credentials-secret-name,SECRET_ACL_MAPPING=your-acl-mapping-secret-name"
 
 echo "✓ Cloud Run Job created"
 

@@ -25,7 +25,7 @@ from typing import List, Optional
 from dataclasses import dataclass, field
 
 import requests
-from google.cloud import storage
+from google.cloud import storage, secretmanager
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.api_core.exceptions import GoogleAPIError, NotFound
 from dotenv import load_dotenv
@@ -70,8 +70,37 @@ class Config:
     source_base_url: str = field(default_factory=lambda: os.environ.get(
                                    "SOURCE_BASE_URL", "https://jsonplaceholder.typicode.com"))
 
+    # Secret Manager configuration
+    secret_api_credentials: str = field(default_factory=lambda: os.environ.get(
+                                   "SECRET_API_CREDENTIALS", ""))
+    secret_acl_mapping: str = field(default_factory=lambda: os.environ.get(
+                                   "SECRET_ACL_MAPPING", ""))
+
     # Sync mode: "full" replaces everything; "incremental" adds/updates only
     sync_mode:     str = field(default_factory=lambda: os.environ.get("SYNC_MODE", "full"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 0: SECRETS  —  Fetch dynamic configuration from Secret Manager
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_secret(project_id: str, secret_name: str) -> Optional[str]:
+    """
+    Fetch a payload from Google Cloud Secret Manager.
+    Requires roles/secretmanager.secretAccessor
+    """
+    if not secret_name:
+        return None
+    
+    log.info(f"Fetching secret: {secret_name}")
+    try:
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+        response = client.access_secret_version(request={"name": name})
+        return response.payload.data.decode("UTF-8")
+    except Exception as e:
+        log.warning(f"Failed to fetch secret '{secret_name}': {e}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,7 +159,7 @@ def encode_text(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("utf-8")
 
 
-def build_document(post: dict, users: dict, comments: List[dict]) -> dict:
+def build_document(post: dict, users: dict, comments: List[dict], acl_mapping: dict = None) -> dict:
     """
     Convert a JSONPlaceholder post into a Discovery Engine Document.
 
@@ -165,7 +194,7 @@ def build_document(post: dict, users: dict, comments: List[dict]) -> dict:
     if comment_text:
         full_content += f"\n\nComments:\n{comment_text}"
 
-    return {
+    doc = {
         # Stable unique ID — format must never change after first sync
         "id": f"jsonplaceholder-post-{post_id}",
 
@@ -189,12 +218,18 @@ def build_document(post: dict, users: dict, comments: List[dict]) -> dict:
         },
     }
 
+    if acl_mapping:
+        doc["aclInfo"] = acl_mapping
+
+    return doc
+
 
 def build_all_documents(
     posts: List[dict],
     users: dict,
     base_url: str,
     include_comments: bool = True,
+    acl_mapping: dict = None,
 ) -> List[dict]:
     """
     Build Discovery Engine documents for all posts.
@@ -211,7 +246,7 @@ def build_all_documents(
             except requests.HTTPError as e:
                 log.warning(f"  Could not fetch comments for post {post_id}: {e}")
 
-        doc = build_document(post, users, comments)
+        doc = build_document(post, users, comments, acl_mapping)
         documents.append(doc)
 
         if i % 10 == 0 or i == total:
@@ -400,6 +435,8 @@ def ensure_infrastructure(cfg: Config) -> int:
             industry_vertical=discoveryengine.IndustryVertical.GENERIC,
             solution_types=[discoveryengine.SolutionType.SOLUTION_TYPE_SEARCH],
             content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
+            # Enable ACL support directly
+            acl_enabled=True,
         )
         request = discoveryengine.CreateDataStoreRequest(
             parent=parent,
@@ -408,7 +445,7 @@ def ensure_infrastructure(cfg: Config) -> int:
         )
         operation = ds_client.create_data_store(request=request)
         operation.result()  # Wait for creation
-        log.info(f"  ✓ Data Store '{cfg.data_store_id}' created successfully.")
+        log.info(f"  ✓ Data Store '{cfg.data_store_id}' created successfully with ACL support enabled.")
         return int(discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED)
 
 
@@ -426,6 +463,10 @@ def validate_document(doc: dict, index: int) -> bool:
     content = doc.get("content", {})
     if content and "rawBytes" not in content:
         errors.append("'content.rawBytes' missing when content is provided")
+    
+    acl_info = doc.get("aclInfo")
+    if acl_info is not None and not isinstance(acl_info, dict):
+        errors.append("'aclInfo' must be a dict")
 
     if errors:
         log.error(f"Document [{index}] id={doc.get('id','?')} validation failed: {errors}")
@@ -452,12 +493,16 @@ def preview_documents(documents: List[dict], count: int = 2) -> None:
     log.info(f"\n{'='*60}")
     log.info(f"DOCUMENT PREVIEW ({min(count, len(documents))} of {len(documents)})")
     log.info(f"{'='*60}")
+    import copy
     for doc in documents[:count]:
-        # Decode content for readability
-        preview = dict(doc)
+        # Decode content for readability using a deepcopy to avoid corrupting the real payload
+        preview = copy.deepcopy(doc)
         if "content" in preview and "rawBytes" in preview["content"]:
-            decoded = base64.b64decode(preview["content"]["rawBytes"]).decode("utf-8")
-            preview["content"]["rawBytes"] = f"<decoded> {decoded[:200]}..."
+            try:
+                decoded = base64.b64decode(preview["content"]["rawBytes"]).decode("utf-8")
+                preview["content"]["rawBytes"] = f"<decoded> {decoded[:200]}..."
+            except Exception:
+                pass
         print(json.dumps(preview, indent=2))
     log.info(f"{'='*60}\n")
 
@@ -484,13 +529,33 @@ def run(cfg: Config, local_preview_only: bool = False) -> None:
     log.info(f"DataStore : {cfg.data_store_id}")
     log.info("=" * 60)
 
+    # ── STEP 0: SECRETS ──────────────────────────────────────────
+    acl_mapping = None
+    if cfg.secret_api_credentials:
+        api_creds = fetch_secret(cfg.project_id, cfg.secret_api_credentials)
+        if api_creds:
+            log.info("  ✓ Successfully fetched API credentials from Secret Manager")
+    
+    if cfg.secret_acl_mapping:
+        acl_payload = fetch_secret(cfg.project_id, cfg.secret_acl_mapping)
+        if acl_payload:
+            try:
+                acl_mapping = json.loads(acl_payload)
+                log.info("  ✓ Successfully fetched and parsed ACL mapping from Secret Manager")
+            except json.JSONDecodeError as e:
+                log.warning(f"  Failed to parse ACL mapping as JSON: {e}")
+
     # ── STEP 1: FETCH ────────────────────────────────────────────
     posts = fetch_posts(cfg.source_base_url)
+    # LIMIT to 10 documents for testing as requested
+    posts = posts[:10]
+    log.info(f"  → Limited to {len(posts)} posts for testing")
+    
     users = fetch_users(cfg.source_base_url)
 
     # ── STEP 2: TRANSFORM ────────────────────────────────────────
     log.info("Transforming posts to Discovery Engine document format...")
-    documents = build_all_documents(posts, users, cfg.source_base_url)
+    documents = build_all_documents(posts, users, cfg.source_base_url, acl_mapping=acl_mapping)
 
     # ── STEP 3: VALIDATE ─────────────────────────────────────────
     documents = validate_all_documents(documents)

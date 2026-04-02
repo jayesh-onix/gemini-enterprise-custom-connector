@@ -116,22 +116,41 @@ gcloud services enable \
   discoveryengine.googleapis.com \
   storage.googleapis.com \
   run.googleapis.com \
-  cloudbuild.googleapis.com
+  cloudbuild.googleapis.com \
+  secretmanager.googleapis.com
 ```
 
-**Step 2.2 — Grant IAM roles**
+**Step 2.2 — Create a dedicated Service Account**
 
 ```bash
+gcloud iam service-accounts create ge-connector-sa \
+  --description="Service account for Gemini Enterprise Connector" \
+  --display-name="GE Connector SA"
+```
+
+**Step 2.3 — Grant IAM roles**
+
+Grant the required roles to the new Service Account so it can run securely in Cloud Run:
+
+```bash
+SA_EMAIL="ge-connector-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com"
+
 gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="user:your-email@example.com" \
+  --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/discoveryengine.editor"
 
 gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="user:your-email@example.com" \
+  --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/storage.admin"
+
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="roles/secretmanager.secretAccessor"
 ```
 
-✅ **Checkpoint:** APIs enabled and IAM Roles granted.
+*(Note: If you plan to run the connector locally in Phase 3, ensure your personal user account `user:your-email@example.com` also has these same three roles.)*
+
+✅ **Checkpoint:** APIs enabled, Service Account created, and IAM Roles granted.
 
 *(Note: The connector script will now automatically create the GCS bucket and the Discovery Engine Data Store if they do not exist.)*
 
@@ -172,6 +191,8 @@ GCP_PROJECT_ID=your-project \
 GCS_BUCKET=jsonplaceholder-ge-connector-staging \
 DATA_STORE_ID=jsonplaceholder-test-store \
 SYNC_MODE=full \
+SECRET_API_CREDENTIALS=your-api-credentials-secret-name \
+SECRET_ACL_MAPPING=your-acl-mapping-secret-name \
 venv/bin/python connector.py
 ```
 
@@ -244,11 +265,14 @@ gcloud builds submit \
 **Step 7.2 — Create Cloud Run Job**
 
 ```bash
+SA_EMAIL="ge-connector-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com"
+
 gcloud run jobs create jsonplaceholder-sync-job \
   --image gcr.io/YOUR_PROJECT_ID/jsonplaceholder-ge-connector \
   --region us-central1 \
   --max-retries 2 \
-  --set-env-vars "GCP_PROJECT_ID=your-project,GCS_BUCKET=jsonplaceholder-ge-connector-staging,DATA_STORE_ID=jsonplaceholder-test-store,SYNC_MODE=full"
+  --service-account="${SA_EMAIL}" \
+  --set-env-vars "GCP_PROJECT_ID=YOUR_PROJECT_ID,GCS_BUCKET=jsonplaceholder-ge-connector-staging,DATA_STORE_ID=jsonplaceholder-test-store,SYNC_MODE=full,SECRET_API_CREDENTIALS=your-api-credentials-secret-name,SECRET_ACL_MAPPING=your-acl-mapping-secret-name"
 ```
 
 **Step 7.3 — Test the Cloud Run Job manually**
