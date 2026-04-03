@@ -1,28 +1,34 @@
 #!/bin/bash
 # =============================================================================
 # JSONPlaceholder → Gemini Enterprise Connector
-# GCP Setup Script
-# =============================================================================
-# Run each section manually — do NOT run this entire script at once.
-# Each section corresponds to a numbered step in the README.
+# GCP Setup Script (Optimized)
 # =============================================================================
 
 set -euo pipefail
 
-# ── FILL THESE IN BEFORE RUNNING ─────────────────────────────────────────────
-export PROJECT_ID="search-ahmed"
-export REGION="us-central1"
-export GCS_BUCKET="jsonplaceholder-ge-connector-staging"
-export DATA_STORE_ID="jsonplaceholder-test-store"
-export IMAGE_NAME="gcr.io/${PROJECT_ID}/jsonplaceholder-ge-connector"
+# ── CONFIGURATION ────────────────────────────────────────────────────────────
+# These will be detected automatically or you can set them here.
+PROJECT_ID=$(gcloud config get-value project)
+REGION="us-central1"
+REPO_NAME="connector-repo"
+IMAGE_NAME="jsonplaceholder-connector"
+SERVICE_ACCOUNT_NAME="ge-connector-sa"
+GCS_BUCKET="${PROJECT_ID}-connector-staging"
+DATA_STORE_ID="jsonplaceholder-store"
 
-# ── STEP 1: Authenticate and set project ─────────────────────────────────────
-gcloud auth login
-gcloud config set project "${PROJECT_ID}"
-gcloud auth application-default login
+# Full path for the Artifact Registry image
+IMAGE_PATH="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${IMAGE_NAME}:latest"
 
-# ── STEP 2: Enable required APIs ─────────────────────────────────────────────
+echo "--------------------------------------------------------"
+echo "Deploying to Project: ${PROJECT_ID}"
+echo "Region:               ${REGION}"
+echo "Image Path:           ${IMAGE_PATH}"
+echo "--------------------------------------------------------"
+
+# ── STEP 1: Enable APIs ──────────────────────────────────────────────────────
+echo "Enabling GCP APIs..."
 gcloud services enable \
+  artifactregistry.googleapis.com \
   discoveryengine.googleapis.com \
   storage.googleapis.com \
   run.googleapis.com \
@@ -30,110 +36,59 @@ gcloud services enable \
   cloudscheduler.googleapis.com \
   secretmanager.googleapis.com
 
-echo "✓ APIs enabled"
+# ── STEP 2: Create Artifact Registry ─────────────────────────────────────────
+echo "Setting up Artifact Registry..."
+gcloud artifacts repositories create "${REPO_NAME}" \
+    --repository-format=docker \
+    --location="${REGION}" \
+    --description="Docker repository for connectors" || true
 
-# ── STEP 3: Grant IAM roles ───────────────────────────────────────────────────
-# Replace USER_EMAIL with your Google account email
-USER_EMAIL="your-email@example.com"
-
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="user:${USER_EMAIL}" \
-  --role="roles/discoveryengine.editor"
-
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="user:${USER_EMAIL}" \
-  --role="roles/storage.admin"
-
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="user:${USER_EMAIL}" \
-  --role="roles/secretmanager.secretAccessor"
-
-# Create a dedicated service account for the connector
-SERVICE_ACCOUNT_NAME="ge-connector-sa"
+# ── STEP 3: Setup Service Account & Permissions ──────────────────────────────
+echo "Configuring Service Account..."
 SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
-echo "Creating service account ${SERVICE_ACCOUNT_EMAIL}..."
-gcloud iam service-accounts create "${SERVICE_ACCOUNT_NAME}" \
-  --display-name="Gemini Enterprise Connector Service Account" || true
+if ! gcloud iam service-accounts describe "${SERVICE_ACCOUNT_EMAIL}" >/dev/null 2>&1; then
+    gcloud iam service-accounts create "${SERVICE_ACCOUNT_NAME}" \
+      --display-name="Gemini Enterprise Connector Service Account"
+fi
 
-# Grant permissions to the service account
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-  --role="roles/discoveryengine.editor"
+# Grant necessary roles
+for ROLE in "roles/discoveryengine.editor" "roles/storage.admin" "roles/secretmanager.secretAccessor"; do
+    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+      --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+      --role="${ROLE}" --quiet > /dev/null
+done
 
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-  --role="roles/storage.admin"
+# ── STEP 4: Build and Push Image ─────────────────────────────────────────────
+echo "Building and pushing container image..."
+gcloud builds submit --tag "${IMAGE_PATH}" .
 
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-  --role="roles/secretmanager.secretAccessor"
-
-echo "✓ IAM roles granted"
-
-# ── STEP 4: Create GCS bucket ────────────────────────────────────────────────
-gsutil mb -p "${PROJECT_ID}" -l "${REGION}" "gs://${GCS_BUCKET}"
-echo "✓ GCS bucket created: gs://${GCS_BUCKET}"
-
-# ── STEP 5: Run connector locally to provision and sync ────────────────────
-echo "Running connector locally..."
-export GCP_PROJECT_ID="${PROJECT_ID}"
-export GCS_BUCKET="${GCS_BUCKET}"
-export DATA_STORE_ID="${DATA_STORE_ID}"
-export SYNC_MODE="full"
-
-python connector.py
-
-echo "✓ Connector run complete — bucket and data store should now be provisioned if they did not already exist."
-
-echo "✓ Local run complete — check GCP Console for import status"
-
-# ── STEP 7: (MANUAL) Connect data store to GE App ────────────────────────────
-echo ""
-echo "⚠ MANUAL STEP REQUIRED:"
-echo "  1. Go to GCP Console → Gemini Enterprise → Apps"
-echo "  2. Click your app (or Create app → Search type)"
-echo "  3. Go to 'Connected data stores'"
-echo "  4. Click '+ New data store'"
-echo "  5. Select: ${DATA_STORE_ID}"
-echo "  6. Click Save"
-echo "  7. Wait for status to show 'Active'"
-echo ""
-read -p "Press Enter after completing the manual step above..."
-
-# ── STEP 8: Deploy as Cloud Run Job (for production automation) ───────────────
-gcloud builds submit \
-  --tag "${IMAGE_NAME}" \
-  --project "${PROJECT_ID}"
-
-gcloud run jobs create jsonplaceholder-sync-job \
-  --image "${IMAGE_NAME}" \
+# ── STEP 5: Create Cloud Run Job ─────────────────────────────────────────────
+echo "Creating Cloud Run Job..."
+# Note: We use --set-env-vars to pass configuration to the script
+gcloud run jobs deploy jsonplaceholder-sync-job \
+  --image "${IMAGE_PATH}" \
   --region "${REGION}" \
   --service-account "${SERVICE_ACCOUNT_EMAIL}" \
-  --max-retries 2 \
-  --set-env-vars "GCP_PROJECT_ID=${PROJECT_ID},GCS_BUCKET=${GCS_BUCKET},DATA_STORE_ID=${DATA_STORE_ID},SYNC_MODE=full,SECRET_API_CREDENTIALS=your-api-credentials-secret-name,SECRET_ACL_MAPPING=your-acl-mapping-secret-name"
+  --max-retries 3 \
+  --set-env-vars "GCP_PROJECT_ID=${PROJECT_ID},GCS_BUCKET=${GCS_BUCKET},DATA_STORE_ID=${DATA_STORE_ID},SYNC_MODE=incremental"
 
-echo "✓ Cloud Run Job created"
-
-# ── STEP 9: Test the Cloud Run Job ───────────────────────────────────────────
-gcloud run jobs execute jsonplaceholder-sync-job \
-  --region "${REGION}" \
-  --wait
-
-echo "✓ Test execution complete"
-
-# ── STEP 10: Create Cloud Scheduler for ongoing sync ─────────────────────────
-JOB_URI=$(gcloud run jobs describe jsonplaceholder-sync-job \
-  --region "${REGION}" \
-  --format "value(metadata.selfLink)")
-
-gcloud scheduler jobs create http jsonplaceholder-sync-schedule \
-  --schedule "0 */4 * * *" \
+# ── STEP 6: Schedule the Job (Every 60 minutes) ──────────────────────────────
+echo "Scheduling job..."
+# Cron "0 * * * *" means "at minute 0 of every hour"
+gcloud scheduler jobs create http jsonplaceholder-hourly-sync \
+  --location "${REGION}" \
+  --schedule "0 * * * *" \
   --uri "https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/jsonplaceholder-sync-job:run" \
-  --message-body "{}" \
+  --http-method POST \
   --oauth-service-account-email "${SERVICE_ACCOUNT_EMAIL}" \
-  --location "${REGION}"
+  --description "Triggers the JSONPlaceholder sync every 60 minutes" || \
+gcloud scheduler jobs update http jsonplaceholder-hourly-sync \
+  --location "${REGION}" \
+  --schedule "0 * * * *"
 
-echo "✓ Cloud Scheduler created — syncs every 4 hours"
-echo ""
-echo "✅ Full setup complete!"
+echo "--------------------------------------------------------"
+echo "✅ DEPLOYMENT COMPLETE"
+echo "Job:      jsonplaceholder-sync-job"
+echo "Schedule: Every 60 minutes (0 * * * *)"
+echo "--------------------------------------------------------"
