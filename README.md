@@ -38,17 +38,36 @@ graph TD
     G -->|Search / Chat| H((End User))
 ```
 
+## **Security: Access Control (ACL) & Secret Manager**
+
+This connector implements **Enterprise Document-Level Security**. This means that when data is synced to Gemini, it is tagged with specific permissions.
+
+### **1. Secret Manager Setup**
+The connector dynamically fetches the "Security Policy" from Google Secret Manager.
+
+**Create the ACL mapping secret:**
+```bash
+echo -n '{"readers": [{"user": "your-email@example.com"}, {"group": "all-engineers@example.com"}]}' | \
+gcloud secrets create ge-acl-mapping --data-file=-
+```
+
+### **2. How it Works (Identity Join)**
+- **Step 1:** The connector pulls your policy from the secret.
+- **Step 2:** Every JSONL document is tagged with these specific `readers`.
+- **Step 3:** At search-time, Gemini checks the identity of the user asking the question. 
+- **Step 4:** If the user is **not** in the "Readers" list, the document is hidden from them.
+
+### **3. Setting up "Access for All"**
+To give everyone in your company access:
+Update the secret to include a domain-wide group:
+`{"readers": [{"group": "everyone@yourdomain.com"}]}`
+
 ---
 
-## Key Features
-
-- **Auto-Provisioning:** Automatically detects and creates missing GCS buckets and Vertex AI Data Stores.
-- **Incremental Sync:** Intelligent delta-syncs using `--since` timestamps to fetch only new or modified data.
-- **GCS Staging:** Batches data into `.jsonl` for high-performance ingestion (recommended for production).
-- **Fast Testing:** Built-in randomization logic that samples **25 records** per run to keep iteration cycles under 60 seconds.
-- **Dynamic Content:** Injects random `SyncID` salts during testing to ensure Discovery Engine detects changes for incremental verification.
-- **Production Ready:** Includes a `Dockerfile` for Cloud Run Jobs and a `setup.sh` for automated GCP deployment.
-- **Enterprise Security (NEW):** Integrated with Google Secret Manager to dynamically inject API keys and Document-Level Access Controls (ACLs). Runs on a dedicated least-privilege service account.
+## **Key Features**
+- **Auto-Provisioning:** Automatically creates GCS buckets and **ACL-enabled** Data Stores.
+- **Enterprise Security:** Documents are tagged with `AclInfo` to enforce per-user permissions.
+- **Scalable Sync:** Uses Google's optimized GCS staging pattern for bulk ingestion.
 
 ---
 

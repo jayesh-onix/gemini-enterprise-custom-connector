@@ -23,21 +23,6 @@ from dataclasses import dataclass, field
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-def get_session(retries=3, backoff_factor=0.3):
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        read=retries,
-        connect=retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=(500, 502, 504)
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
 from google.cloud import storage, secretmanager
 from google.cloud import discoveryengine_v1alpha as discoveryengine
 from google.api_core.exceptions import GoogleAPIError, NotFound
@@ -90,6 +75,25 @@ class Config:
 
     # Sync mode: "full" replaces everything; "incremental" adds/updates only
     sync_mode:     str = field(default_factory=lambda: os.environ.get("SYNC_MODE", "incremental"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NETWORKING UTILS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_session(retries=3, backoff_factor=0.3):
+    """Creates a robust requests session with retries and backoff."""
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=(429, 500, 502, 503, 504)
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE FUNCTIONS
@@ -217,6 +221,7 @@ def ensure_infrastructure(cfg: Config, auto_create: bool = True) -> int:
                 industry_vertical=discoveryengine.IndustryVertical.GENERIC,
                 solution_types=[discoveryengine.SolutionType.SOLUTION_TYPE_SEARCH],
                 content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
+                acl_enabled=True,
             )
             request = discoveryengine.CreateDataStoreRequest(
                 parent=parent,
@@ -289,7 +294,6 @@ def run_sync(since: Optional[str] = None, preview: bool = False, auto_create: bo
     if cfg.secret_acl_mapping:
         acl_payload = fetch_secret(cfg.project_id, cfg.secret_acl_mapping)
         if acl_payload:
-            import json
             try:
                 acl_mapping = json.loads(acl_payload)
             except Exception as e:

@@ -111,7 +111,7 @@ gcloud run jobs create jsonplaceholder-sync-job \
   --region "${REGION}" \
   --service-account "${SERVICE_ACCOUNT_EMAIL}" \
   --max-retries 2 \
-  --set-env-vars "GCP_PROJECT_ID=${PROJECT_ID},GCS_BUCKET=${GCS_BUCKET},DATA_STORE_ID=${DATA_STORE_ID},SYNC_MODE=full"
+  --set-env-vars "GCP_PROJECT_ID=${PROJECT_ID},GCS_BUCKET=${GCS_BUCKET},DATA_STORE_ID=${DATA_STORE_ID},SYNC_MODE=full,SECRET_API_CREDENTIALS=your-api-credentials-secret-name,SECRET_ACL_MAPPING=your-acl-mapping-secret-name"
 
 echo "✓ Cloud Run Job created"
 
